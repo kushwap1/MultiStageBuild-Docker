@@ -1,1 +1,78 @@
 https://levelup.gitconnected.com/docker-multi-stage-builds-and-copy-from-other-images-3bf1a2b095e0
+
+
+Today I had a pleasurable experience with Docker multi-stage builds and the COPY --from build command. Docker multi-stage builds allow you to reduce the final image size and complexity by using multiple FROM statements in a single Dockerfile.
+Each FROM statement introduces a new build stage, which can also be given a name using FROM as name. The layers of all stages except for the last one will be erased after docker build (i.e. the last FROM starts the actual image that is being built.) During the build, artifacts can be copied from one stage to another using COPY --from=name src dest (or a number, beginning at 0, for unnamed stages.) But something I bumped into more or less accidentally is the fact that COPY --from=image:tag can also be used to copy artifacts from other, existing images, potentially enabling you to cook up an image from several existing images:
+Optionally COPY accepts a flag --from=<name|index> that can be used to set the source location to a previous build stage (created with FROM .. AS <name>) that will be used instead of a build context sent by the user. The flag also accepts a numeric index assigned for all previous build stages started with FROM instruction. In case a build stage with a specified name can’t be found an image with the same name is attempted to be used instead. source
+I enjoyed these two discoveries as much as I want to share them in this article; perhaps I can even add something valuable to one or two’s docker toolbox.
+
+The Use Case
+I needed to build a docker image that provides a MySQL database with data already being populated as the container starts. The official mysql docker image provides a directory, /docker-entrypoint-initdb.d, into which one can put .sql files that will be loaded upon container start. But that was not sufficient for my case. Indeed, I had to load some .sql files but thereafter I needed to run a Java program that augmented the database with more data (based on the loaded .sql files, so it was a dynamic task that could change over time.)
+This final database, or its data to be more precise, had to be captured in a docker image so that developers could quickly spin up a fully functioning, populated database. My plan was to start a MySQL server, import the .sql files, then run my Java program against that database and finally generate an sql dump (i.e. dump all data from the database into a single file.) If I had such an sql dump it would be a breeze to create a mysql docker image and copy the dump to /docker-entrypoint-initdb.d. Fortunately, docker provided me the tools to implement the whole process in a very neat way.
+
+The Solution
+The procedure described in The Use Case could be executed in the context of a Dockerfile, which means it can be triggered by simply running docker build .... Let’s dive into it!
+
+=================================================================================================================
+FROM mysql:5 as sqldump
+WORKDIR /home
+
+# Copy required artifacts and source code
+COPY initial.sql .
+COPY java-program ./java-program
+COPY sqldump.sh .
+
+# Copy jdk11 and gradle from the gradle:jdk11 image
+COPY --from=gradle:jdk11 /opt/java /opt/java
+COPY --from=gradle:jdk11 /opt/gradle /opt/gradle
+
+# Set environment variable
+ARG MYSQL_ROOT_PASSWORD=root
+
+# Execute the build script which will generate the sql dump
+RUN chmod u+x sqldump.sh && /bin/bash -c ./sqldump.sh
+
+FROM mysql:5
+COPY --from=sqldump /home/dump.sql.gz /docker-entrypoint-initdb.d
+
+=================================================================================================================
+
+The first thing you should notice is that we have two FROM statements, one at the very beginning and one in the end. That’s docker multi-stage build in action. As you can see, the instructions beneath the second FROM statement are reduced to a single COPY, which will be the only layer added to the mysql base image in the final image produced by docker build!
+Let’s talk through the instructions.
+First stage uses the mysql:5 image as the basis and is named sqldump. The working directory is changed to home, this is where the sql dump will be placed and where the second stage copies it from.
+WORKDIR is followed by several COPY instructions, they will copy required artifacts into the image, such as: The .sql file, the java program and a sqldump.sh shell script, whose content I will cover soon. Instead of externalizing the sql dump to a seperate script, one could have put the shell instructions directly into the Dockerfile. However, having lots of RUN statements would reduce the build speed, since each statement creates a new image layer, while reducing the RUN statements to a single RUN statement using && would make the code incredibly difficult to read, understand, and maintain.
+The last two COPY statements are the nifty ones! The situation here is that I based my image on MySQL but I also need a JDK and Gradle to run my java program. One way to achieve this is by installing them manually, using lots of apt-get install and other “repository-certificate-adding” stuff that is required to install java (and not fun at all.) Much simpler and faster would be to copy complete installations of these programs from existing images. And that is exactly what I’m doing, I copy the whole Gradle and Java installation from the gradle:jdk11 image into the current image, leaving installation of these program up the great people who maintain gradle:jdk11. The only thing left to do is setting $PATH variables to resolve the java and gradle executables, which will be done in the shell script.
+ARG MYSQL_ROOT_PASSWORD=root is the password to connect to the MySQL server.
+Last step of the sqldump stage is to run the shell script, for that to work we first make it executable using chmod. Here’s the shell script content that will take over from now:
+
+
+------------------------------------------------------------------------------------------------------------------
+
+#!/bin/bash
+
+# Add java and gradle to path variable
+export JAVA_HOME=/opt/java/openjdk
+export GRADLE_HOME=/opt/gradle
+export PATH=$PATH:$JAVA_HOME/bin:$GRADLE_HOME/bin
+
+# Start MySQL server in background
+docker-entrypoint.sh mysqld &
+# Give MySQL server time to boot
+sleep 15
+# Execute initial.sql on the DB
+mysql -h127.0.0.1 -uroot -proot < initial.sql
+# Execute java program that will augment data
+cd java-program && gradle run && cd ..
+# Dump the whole db into a compressed, single file
+mysqldump -h127.0.0.1 -uroot -proot --databases schema1 schema2 | gzip -9 -c > dump.sql.gz
+
+----------------------------------------------------------------------------------------------------------------------
+
+Most instructions speak for itself, I will quickly rush through them and capture things worth noticing.
+docker-entrypoint.sh is the MySQL startup script provided by the mysql image. The line is responsible for starting the server in the background (achieved by the & at the end).
+The initial.sql is loaded into the db, afterwards the java program is executed using gradle run. Gradle was only used because the program has 3rd party library dependencies and it appeared to be simpler to resolve those dependencies using a tool like gradle or maven instead of downloading them on my own.
+Finally mysqldump(shipped in mysql image), generates our desired dump file, containing all required db schemas!
+That’s it, docker will now move on to the second stage where the dump.sql.gz file from the first stage is copied to /docker-entrypoint-initdb.d, adding only a single image layer to the base image. All layers from the first stage will be erased from your disk when docker build ... finishes.
+
+Conclusion
+I was used to copy pre-built artifacts into my docker images and build those artifacts outside of the docker build context. Docker multi-stage build and COPY --from=image:tag made me realize, that docker is capable of tackling way more of the build process, thus taking away more responsibility and constraints from the system that wants to build the software. I often ended up compiling and preparing the artifacts in a CI/CD pipeline, crowned with a docker build instruction that only ever copied these artifacts into the image. Moving more of this work into the Dockerfile makes the build more transparent to other developers and easier to execute on different machines. The CI/CD pipeline reduces to singe docker build instruction. Multi-stage builds ensure that the final image is still as lean as possible.
